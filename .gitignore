@@ -1,0 +1,17 @@
+# 技能文檔系統 .gitignore
+
+# 不追蹤上層目錄的敏感檔案
+.env.keys
+.vault/
+classified/
+memory/
+
+# 不追蹤其他子倉庫
+shared-knowledge/
+skills/
+
+# 臨時檔
+*.log
+*.tmp
+*~
+.DS_Store
