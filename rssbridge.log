@@ -1,0 +1,4 @@
+[Tue Mar 31 12:36:47 2026] PHP 8.3.6 Development Server (http://127.0.0.1:3000) started
+[Tue Mar 31 12:36:59 2026] 127.0.0.1:53130 Accepted
+[Tue Mar 31 12:36:59 2026] 127.0.0.1:53130 [500]: HEAD /?action=display&bridge=Twitter&format=Json&type=search&u=%23AI
+[Tue Mar 31 12:36:59 2026] 127.0.0.1:53130 Closing
