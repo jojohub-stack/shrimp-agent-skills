@@ -95,8 +95,58 @@ def get_ai_analysis(capital, current, daily, float_p, trades_str):
     # 若配置使用雲端模型（例如 Google Gemma 4）
     cloud_provider = os.environ.get('CLOUD_PROVIDER')
     cloud_key = os.environ.get('CLOUD_API_KEY')
-    # 預設使用 Google Gemma-4 A4B，可由環境變數 CLOUD_MODEL 覆寫
-    cloud_model = os.environ.get('CLOUD_MODEL', 'google/gemma-4-26b-a4b-it')
+    # Resolve preferred model following priority: env override -> ~/.hermes/config.yaml -> ~/.hermes/.env -> hardcoded default
+    def _resolve_preferred_model() -> str:
+        # 1) explicit env overrides
+        m = os.environ.get('CLOUD_MODEL') or os.environ.get('HERMES_MAIN_MODEL')
+        if m:
+            return m.strip()
+        # 2) try ~/.hermes/config.yaml for common keys
+        try:
+            cfg_path = os.path.expanduser('~/.hermes/config.yaml')
+            if os.path.exists(cfg_path):
+                try:
+                    import yaml
+                    with open(cfg_path, 'r', encoding='utf-8') as f:
+                        cfg = yaml.safe_load(f) or {}
+                except Exception:
+                    # fallback: simple key search without yaml
+                    cfg = None
+                if isinstance(cfg, dict):
+                    lookup_keys = ('model', 'main_model', 'display.model', 'provider.model')
+                    for key in lookup_keys:
+                        parts = key.split('.')
+                        cur = cfg
+                        for p in parts:
+                            if isinstance(cur, dict) and p in cur:
+                                cur = cur[p]
+                            else:
+                                cur = None
+                                break
+                        if isinstance(cur, str) and cur:
+                            return cur.strip()
+        except Exception:
+            pass
+        # 3) fallback to ~/.hermes/.env
+        try:
+            envf = os.path.expanduser('~/.hermes/.env')
+            if os.path.exists(envf):
+                for line in open(envf, encoding='utf-8').read().splitlines():
+                    s = line.strip()
+                    if not s or s.startswith('#'):
+                        continue
+                    for name in ('CLOUD_MODEL', 'GOOGLE_MODEL', 'GEMMA_MODEL'):
+                        if s.startswith(name + '='):
+                            v = s.split('=', 1)[1].strip().strip('"\'')
+                            if v:
+                                return v
+        except Exception:
+            pass
+        # 4) hardcoded default
+        return 'google/gemma-4-26b-a4b-it'
+
+    # resolved preferred model (may be non-Google, e.g. gpt-5-mini)
+    cloud_model = _resolve_preferred_model()
 
     # Normalize model identifiers into a form usable in the Generative Language API URL.
     # Accepts: 'google/gemma-...', 'gemma-...', 'models/gemma-...', or full 'projects/.../models/...'
