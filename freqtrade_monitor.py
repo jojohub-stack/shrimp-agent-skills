@@ -261,19 +261,23 @@ def get_ai_analysis(capital, current, daily, float_p, trades_str):
             "max_tokens": 256,
             "temperature": 0.2
         }
-        max_attempts = 5
-        backoff_seconds = [2, 4, 8, 16, 30]
+        # 針對本地 Ollama 的呼叫：較短的重試策略 + 指定 timeout
+        max_attempts = 3
+        backoff_seconds = [2, 6, 18]
         attempt = 0
         while attempt < max_attempts:
             try:
+                # timeout 設為 60 秒（model 載入時可能較慢），若超時則重試
                 r = requests.post(api_url, json=payload, timeout=60)
             except requests.exceptions.Timeout:
                 if attempt < max_attempts - 1:
-                    time.sleep(backoff_seconds[min(attempt, len(backoff_seconds)-1)])
+                    wait = backoff_seconds[min(attempt, len(backoff_seconds)-1)]
+                    time.sleep(wait)
                     attempt += 1
                     continue
                 return '本地 AI 正忙碌或正在載入模型，略過 AI 分析。'
             except Exception as e:
+                # 不要因為 AI 模組例外而終止整個監控流程，回傳錯誤訊息並繼續
                 return f'AI 模組異常: {str(e)}'
 
             text = None
