@@ -1,0 +1,25 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 18789,
+    "bind": "loopback",
+    "tls": false
+  },
+  "auth": {
+    "mode": "token",
+    "token": "6f8034...94e5"
+  },
+  "plugins": {
+    "enabled": [
+      "ollama",
+      "github-copilot",
+      "nvidia"
+    ]
+  },
+  "telegram": {
+    "enabled": true,
+    "webhook": {
+      "enabled": false
+    }
+  }
+}

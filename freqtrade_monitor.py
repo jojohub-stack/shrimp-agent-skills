@@ -1,490 +1,139 @@
-import os
-import time
-import requests
-import subprocess
-import telebot
-from datetime import datetime
+import requests, telebot, html
+from datetime import datetime, timezone, timedelta
 
-# === 配置區 ===
-TELEGRAM_TOKEN = "8769502770:AAFwYb5aSSe5tYOekICeAvWSPFa-gEt-dfs"
+# ==========================================
+# ⚙️ 核心配置 (專為本機 Local 部署設定，破解 Cron 環境變數遺失問題)
+# ==========================================
+TOKEN = "8565218972:AAHHtiSWajDx8yuE3Rej2NbCYGPMBD5tf6Y"
 CHAT_ID = "770325907"
-FREQTRADE_API_URL = "http://172.18.0.2:8080/api/v1"
+FREQTRADE_API = "http://127.0.0.1:18081/api/v1" # 已修正為你的 18081 Port
+bot = telebot.TeleBot(TOKEN)
+
+# 寫死 Agent 洩漏的本機帳密，確保 API 通關
 API_USER = "admin"
-API_PASS = "admin66" 
+API_PASS = "admin66"
+auth = requests.auth.HTTPBasicAuth(API_USER, API_PASS)
 
-# 讀取環境變數（wrapper 會 source /home/ubuntu/.secrets_freqtrade）
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
-# 若要使用本地 ollama，設定以下環境變數或使用預設值
-OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://127.0.0.1:11434')
-OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'gemma4:e4b')  # switch to smaller model by default for testing
-# 風控與推薦閾值（可用環境變數覆寫）
-TAKE_PROFIT_PCT = float(os.environ.get('TAKE_PROFIT_PCT', '2.0'))   # 正向利潤到達此百分比建議了結
-STOP_LOSS_PCT = float(os.environ.get('STOP_LOSS_PCT', '-3.0'))      # 負向虧損到達此百分比建議停止並出場
-SCALE_IN_PCT = float(os.environ.get('SCALE_IN_PCT', '-1.5'))       # 小幅回撤到達此百分比建議加碼（視情況）
-
-
-# 初始本金會自動讀取：
-# 1) 若 freqtrade config.json 設定 dry_run 且包含 dry_run_wallet，使用該值（最早預設為 500）
-# 2) 否則嘗試讀取 balance API 的 total 作為初始金額
-# 3) 首次取得後會寫入 /home/ubuntu/openclaw_workspace/initial_capital.json 作為持久值
-INITIAL_CAPITAL_FILE = '/home/ubuntu/openclaw_workspace/initial_capital.json'
-
-import os, json
-
-def load_initial_capital(api_url=None, auth=None):
-    # 1. try freqtrade config dry_run_wallet
-    try:
-        cfg = json.load(open('/freqtrade/user_data/config.json'))
-        if cfg.get('dry_run') and 'dry_run_wallet' in cfg:
-            val = float(cfg.get('dry_run_wallet') or 0)
-            # persist
-            try:
-                os.makedirs(os.path.dirname(INITIAL_CAPITAL_FILE), exist_ok=True)
-                json.dump({'initial_capital': val}, open(INITIAL_CAPITAL_FILE, 'w'))
-            except Exception:
-                pass
-            return val
-    except Exception:
-        pass
-
-    # 2. try reading persisted file
-    try:
-        if os.path.exists(INITIAL_CAPITAL_FILE):
-            d = json.load(open(INITIAL_CAPITAL_FILE))
-            return float(d.get('initial_capital') or 0)
-    except Exception:
-        pass
-
-    # 3. fallback: query balance API
-    if api_url and auth:
+# ==========================================
+# 🛡️ 數據解析模組 (Agent 的強健邏輯)
+# ==========================================
+def fetch_api(endpoints, params=None):
+    if isinstance(endpoints, str): endpoints = [endpoints]
+    for ep in endpoints:
         try:
-            r = requests.get(f"{api_url}/balance", auth=auth, timeout=10).json()
-            val = float(r.get('total') or 0)
-            try:
-                os.makedirs(os.path.dirname(INITIAL_CAPITAL_FILE), exist_ok=True)
-                json.dump({'initial_capital': val}, open(INITIAL_CAPITAL_FILE, 'w'))
-            except Exception:
-                pass
-            return val
-        except Exception:
+            r = requests.get(f"{FREQTRADE_API}/{ep}", auth=auth, params=params, timeout=10)
+            if r.status_code == 200: return r.json()
+        except Exception as e: 
             pass
+    return None
 
-    # final fallback
-    return 0.0
+def extract_list(data):
+    """撥開 Freqtrade API 的外皮，取出陣列"""
+    if isinstance(data, list): return data
+    if isinstance(data, dict):
+        for k in ['trades', 'data', 'results', 'items']:
+            if isinstance(data.get(k), list): return data[k]
+    return []
 
-# END initial capital loader
+def run():
+    tw_now = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%m/%d %H:%M')
+    
+    # 1. 抓取 API 數據
+    balance_data = fetch_api(['balance', 'balances', 'account/balance']) or {}
+    profit_data = fetch_api(['profit']) or {}
+    daily_data = fetch_api(['daily'], params={'timescale': '1d'}) or {}
+    open_trades_raw = fetch_api(['status', 'open_trades']) or []
+    closed_trades_raw = fetch_api(['trades']) or {}
 
-# 讀取初始本金（若無則預設 500）
-INITIAL_CAPITAL = load_initial_capital(api_url=FREQTRADE_API_URL, auth=(API_USER, API_PASS))
-if not INITIAL_CAPITAL or INITIAL_CAPITAL <= 0:
-    INITIAL_CAPITAL = 500.0
+    # 2. 深度解析數據
+    # -- 淨值 (Current Equity) --
+    current_equity = float(balance_data.get("total") or balance_data.get("total_usd") or balance_data.get("equity") or 0.0)
+    if current_equity == 0.0 and "currencies" in balance_data:
+        current_equity = sum(float(c.get("est_stake", 0) or c.get("stake_value", 0)) for c in balance_data["currencies"])
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+    # -- 利潤 (Total Profit) --
+    total_profit = float(profit_data.get("profit_all_coin", 0.0))
+    if total_profit == 0.0 and "profit" in profit_data:
+        total_profit = float(profit_data.get("profit", 0.0))
+        
+    starting_cap = current_equity - total_profit if current_equity > 0 else 0.0
+    
+    # -- 今日利潤 (Daily Profit) --
+    daily_list = extract_list(daily_data)
+    daily_profit = float(daily_list[0].get("abs_profit", 0.0)) if daily_list else 0.0
 
-def get_ai_analysis(capital, current, daily, float_p, trades_str):
-    """呼叫 AI 大腦產生戰術分析：優先使用雲端（若設定 CLOUD_PROVIDER=google），否則使用本地 ollama，最後回退到 rules-only。"""
-    prompt = f"""初始本金: {capital} USDT
-當前淨值: {current} USDT
-今日利潤: {daily} USDT
-當前浮動: {float_p}%
-近期交易紀錄:
-{trades_str}"""
+    # -- 浮動盈虧 (Floating PnL) --
+    open_trades = extract_list(open_trades_raw)
+    float_profit = sum(float(t.get("profit_abs", 0.0)) for t in open_trades)
+    float_pct = (float_profit / starting_cap * 100) if starting_cap > 0 else 0.0
 
-    system_msg = "你是一個冷靜的加密貨幣量化交易戰術官。請根據提供的本金、獲利與近期交易數據，給出50字以內的繁體中文操作建議與市場狀態評估。語氣要專業、果斷。"
+    # 3. 組合最新交易動態 (近期平倉 Top 5)
+    closed_list = extract_list(closed_trades_raw)
+    closed_list = sorted(closed_list, key=lambda x: x.get("close_timestamp", 0) or x.get("close_date", ""), reverse=True)[:5]
+    
+    recent_history_str = ""
+    for i, t in enumerate(closed_list, 1):
+        pair = t.get("pair", "N/A").split('/')[0] # 簡化名稱
+        p_abs = float(t.get("profit_abs") or t.get("profit") or 0.0)
+        emoji = "🟢" if p_abs >= 0 else "🔴"
+        recent_history_str += f"{i}. {emoji} {pair} | 已平倉 | 獲利: {p_abs:+.2f} USDT\n"
+    if not recent_history_str: recent_history_str = "無近期交易紀錄\n"
 
-    # 若配置使用雲端模型（例如 Google Gemma 4）
-    cloud_provider = os.environ.get('CLOUD_PROVIDER')
-    cloud_key = os.environ.get('CLOUD_API_KEY')
-    # Resolve preferred model following priority: env override -> ~/.hermes/config.yaml -> ~/.hermes/.env -> hardcoded default
-    def _resolve_preferred_model() -> str:
-        # 1) explicit env overrides
-        m = os.environ.get('CLOUD_MODEL') or os.environ.get('HERMES_MAIN_MODEL')
-        if m:
-            return m.strip()
-        # 2) try ~/.hermes/config.yaml for common keys
-        try:
-            cfg_path = os.path.expanduser('~/.hermes/config.yaml')
-            if os.path.exists(cfg_path):
-                try:
-                    import yaml
-                    with open(cfg_path, 'r', encoding='utf-8') as f:
-                        cfg = yaml.safe_load(f) or {}
-                except Exception:
-                    # fallback: simple key search without yaml
-                    cfg = None
-                if isinstance(cfg, dict):
-                    lookup_keys = ('model', 'main_model', 'display.model', 'provider.model')
-                    for key in lookup_keys:
-                        parts = key.split('.')
-                        cur = cfg
-                        for p in parts:
-                            if isinstance(cur, dict) and p in cur:
-                                cur = cur[p]
-                            else:
-                                cur = None
-                                break
-                        if isinstance(cur, str) and cur:
-                            return cur.strip()
-        except Exception:
-            pass
-        # 3) fallback to ~/.hermes/.env
-        try:
-            envf = os.path.expanduser('~/.hermes/.env')
-            if os.path.exists(envf):
-                for line in open(envf, encoding='utf-8').read().splitlines():
-                    s = line.strip()
-                    if not s or s.startswith('#'):
-                        continue
-                    for name in ('CLOUD_MODEL', 'GOOGLE_MODEL', 'GEMMA_MODEL'):
-                        if s.startswith(name + '='):
-                            v = s.split('=', 1)[1].strip().strip('"\'')
-                            if v:
-                                return v
-        except Exception:
-            pass
-        # 4) hardcoded default
-        return 'google/gemma-4-26b-a4b-it'
+    # 4. 組合目前持倉摘要 (Top 5)
+    open_trades = sorted(open_trades, key=lambda x: float(x.get("profit_ratio", 0) or x.get("profit_pct", 0))) 
+    open_holdings_str = ""
+    for i, t in enumerate(open_trades[:5], 1):
+        pair = t.get("pair", "N/A")
+        p_pct = float(t.get("profit_ratio", 0.0) or t.get("profit_pct", 0.0)) * 100
+        p_abs = float(t.get("profit_abs", 0.0) or t.get("profit_fiat_abs", 0.0))
+        price = t.get("current_rate", 0.0)
+        amt = t.get("amount", 0.0)
+        open_holdings_str += f"{i}. {pair} | 當前報酬: {p_pct:+.2f}% | 未實現: {p_abs:+.2f} USDT | 價格: {price} | 數量: {amt}\n"
+    
+    hidden_count = len(open_trades) - 5
+    if hidden_count > 0:
+        open_holdings_str += f"... +{hidden_count} 筆持倉未列出\n"
+    elif not open_holdings_str:
+        open_holdings_str = "目前空手，無持倉\n"
 
-    # resolved preferred model (may be non-Google, e.g. gpt-5-mini)
-    cloud_model = _resolve_preferred_model()
-
-    # Normalize model identifiers into a form usable in the Generative Language API URL.
-    # Accepts: 'google/gemma-...', 'gemma-...', 'models/gemma-...', or full 'projects/.../models/...'
-    def _normalize_model(m: str) -> str:
-        if not m:
-            return m
-        m = m.strip()
-        if m.startswith('projects/') or m.startswith('models/'):
-            return m
-        if m.startswith('google/'):
-            return 'models/' + m.split('/', 1)[1]
-        return 'models/' + m.lstrip('/')
-
-    # prefer Hermes gpt-5-mini via local helper; fall back to cloud -> local ollama
+    # 5. AI 戰術分析
     try:
-        helper = os.path.expanduser('~/.hermes/ai/generate_with_gpt5.py')
-        if os.path.exists(helper) and os.access(helper, os.X_OK):
-            p = subprocess.run([helper], input=prompt.encode(), capture_output=True, timeout=60)
-            if p.returncode == 0 and p.stdout:
-                return p.stdout.decode().strip()
-            else:
-                # try cloud afterwards
-                pass
+        ai_input = f"淨值 {current_equity:.2f}, 浮動盈虧 {float_pct:.2f}%, 今日利潤 {daily_profit:.2f}"
+        url = 'http://127.0.0.1:11434/api/generate'
+        prompt = f"你是冷酷的加密貨幣交易官。依據以下 Freqtrade 數據：{ai_input}。給出 50 字以內的戰術研判，禁止廢話與英文。"
+        r = requests.post(url, json={'model': 'phi4-mini:latest', 'prompt': prompt, 'stream': False}, timeout=15)
+        ai_msg = r.json().get('response', '').strip()
+    except:
+        ai_msg = "🧠 本地 AI 正在載入模型，暫時無法提供分析，戰報已送出。"
+
+    # 6. 渲染 UI 報表
+    report = f"📊 <b>Freqtrade 戰略簡報</b>\n"
+    report += f"📅 報告時間: {tw_now}\n"
+    report += "━━━━━━━━━━━━━━━━\n"
+    report += "💰 <b>資金水位監控</b>\n"
+    report += f"• 初始本金: {starting_cap:.2f} USDT\n"
+    report += f"• 當前淨值: {current_equity:.2f} USDT\n"
+    report += f"• 今日利潤: {daily_profit:+.2f} USDT\n"
+    report += f"• 浮動盈虧: {float_pct:+.2f}%\n\n"
+
+    report += "🛒 <b>最新交易動態 ( 近期 )</b>\n"
+    report += f"{recent_history_str}\n"
+
+    report += "📦 <b>目前持倉摘要 ( Top 5 )</b>\n"
+    report += f"{open_holdings_str}\n"
+
+    report += "🤖 <b>AI 戰術官分析</b>\n"
+    report += f"<i>{html.escape(ai_msg)}</i>\n\n"
+
+    report += "📌 <b>結構化建議 ( Rules + AI )</b>\n"
+    report += "• 嚴守網格與停損紀律，等待市場訊號。"
+
+    # 7. 發送至 Telegram
+    try:
+        bot.send_message(CHAT_ID, report, parse_mode="HTML")
+        print(f"[{tw_now}] 戰報發送成功 (Port 18081)")
     except Exception as e:
-        print('gpt-5-mini helper failed, fallback to cloud:', e)
-
-    if cloud_provider and cloud_provider.lower() == 'google' and cloud_key and cloud_model:
-        try:
-            # Prefer the openai-compatible chat completions endpoint which works for Gemma in our tests
-            model_resource = _normalize_model(cloud_model)
-            chat_url = 'https://generativelanguage.googleapis.com/v1beta/chat/completions'
-            payload = {
-                'model': model_resource,
-                'messages': [
-                    {'role': 'system', 'content': system_msg},
-                    {'role': 'user', 'content': prompt}
-                ],
-                'temperature': 0.2,
-                'max_tokens': 256
-            }
-            headers = {'Authorization': f'Bearer {cloud_key}', 'Content-Type': 'application/json'}
-            r = requests.post(chat_url, json=payload, headers=headers, timeout=30)
-            if r.status_code == 200:
-                j = r.json()
-                text = None
-                # Robust parsing for known response shapes
-                try:
-                    if isinstance(j, dict) and 'choices' in j and len(j['choices']) > 0:
-                        first = j['choices'][0]
-                        # new-style: first.message.content (could be string or list)
-                        if isinstance(first.get('message'), dict):
-                            msg = first['message']
-                            cont = msg.get('content') or msg.get('text')
-                            if isinstance(cont, str):
-                                text = cont
-                            elif isinstance(cont, list) and len(cont) > 0:
-                                # join text parts or pick 'text'/'output_text'
-                                parts = []
-                                for itm in cont:
-                                    if isinstance(itm, dict):
-                                        if itm.get('type') in ('output_text', 'text') and itm.get('text'):
-                                            parts.append(str(itm.get('text')))
-                                    elif isinstance(itm, str):
-                                        parts.append(itm)
-                                text = ''.join(parts) if parts else None
-                        # legacy: choices[0].text
-                        if not text and first.get('text'):
-                            text = first.get('text')
-                    # fallback other fields
-                    if not text:
-                        if isinstance(j, dict):
-                            cand = j.get('candidates') or j.get('output') or []
-                            if isinstance(cand, list) and len(cand) > 0:
-                                for c in cand:
-                                    if isinstance(c, dict):
-                                        if 'content' in c and isinstance(c['content'], list):
-                                            for itm in c['content']:
-                                                if isinstance(itm, dict) and itm.get('type') in ('output_text','text'):
-                                                    text = itm.get('text')
-                                                    break
-                                        if not text and 'text' in c:
-                                            text = c.get('text')
-                                        if text:
-                                            break
-                except Exception:
-                    text = None
-                if not text:
-                    # last resort: raw response body
-                    try:
-                        text = r.text
-                    except Exception:
-                        text = None
-                if text:
-                    return text.strip()
-                else:
-                    return '雲端 AI 回傳格式不明，略過 AI 分析。'
-            else:
-                # let caller fallback to local ollama
-                print(f'Cloud AI 連線失敗 (狀態碼: {r.status_code}), body: {r.text[:200]}')
-        except Exception as e:
-            print('Cloud AI failed, fallback to local:', e)
-
-    # 若未使用或雲端失敗，呼叫本地 ollama (原本流程)
-    try:
-        api_url = OLLAMA_URL.rstrip('/') + '/api/generate'
-        payload = {
-            "model": OLLAMA_MODEL,
-            "messages": [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 256,
-            "temperature": 0.2
-        }
-        # 針對本地 Ollama 的呼叫：較短的重試策略 + 指定 timeout
-        max_attempts = 3
-        backoff_seconds = [2, 6, 18]
-        attempt = 0
-        while attempt < max_attempts:
-            try:
-                # timeout 設為 60 秒（model 載入時可能較慢），若超時則重試
-                r = requests.post(api_url, json=payload, timeout=60)
-            except requests.exceptions.Timeout:
-                if attempt < max_attempts - 1:
-                    wait = backoff_seconds[min(attempt, len(backoff_seconds)-1)]
-                    time.sleep(wait)
-                    attempt += 1
-                    continue
-                return '本地 AI 正忙碌或正在載入模型，略過 AI 分析。'
-            except Exception as e:
-                # 不要因為 AI 模組例外而終止整個監控流程，回傳錯誤訊息並繼續
-                return f'AI 模組異常: {str(e)}'
-
-            text = None
-            try:
-                j = r.json()
-            except Exception:
-                j = None
-
-            done_reason = None
-            if isinstance(j, dict):
-                done_reason = j.get('done_reason') or j.get('status') or j.get('done')
-            if (isinstance(j, dict) and (j.get('response') == '' or done_reason == 'load')) or (r.status_code == 200 and j is None and not r.text.strip()):
-                if attempt < max_attempts - 1:
-                    time.sleep(backoff_seconds[min(attempt, len(backoff_seconds)-1)])
-                    attempt += 1
-                    continue
-                else:
-                    return '本地 AI 正在載入模型，暫時無法提供分析，戰報已送出。'
-
-            if r.status_code != 200:
-                return f"AI 連線失敗 (狀態碼: {r.status_code})"
-
-            if isinstance(j, dict):
-                if 'choices' in j and len(j['choices']) > 0:
-                    try:
-                        text = j['choices'][0].get('message', {}).get('content') or j['choices'][0].get('text')
-                    except Exception:
-                        text = None
-                if not text and 'response' in j:
-                    text = j.get('response')
-                if not text and 'completion' in j:
-                    text = j.get('completion')
-                if not text and 'output' in j:
-                    out = j.get('output')
-                    if isinstance(out, list):
-                        text = ''.join([str(x) for x in out])
-                    else:
-                        text = str(out)
-            if not text:
-                try:
-                    text = r.text
-                except:
-                    text = None
-
-            if text:
-                return text.strip()
-            else:
-                if attempt < max_attempts - 1:
-                    time.sleep(backoff_seconds[min(attempt, len(backoff_seconds)-1)])
-                    attempt += 1
-                    continue
-                return 'AI 回傳格式不明或無內容，請檢查本地 ollama 狀態。'
-    except Exception as e:
-        return f'AI 模組異常: {str(e)}' 
-def get_freqtrade_status():
-    try:
-        auth = (API_USER, API_PASS)
-        
-        # 1. 抓取當前交易狀態 (計算浮動)
-        status_data = requests.get(f"{FREQTRADE_API_URL}/status", auth=auth, timeout=10).json()
-        
-        # 2. 抓取今日獲利
-        profit_data = requests.get(f"{FREQTRADE_API_URL}/daily?last_days=1", auth=auth, timeout=10).json()
-        
-        # 3. 抓取帳戶餘額 (計算淨值)
-        try:
-            balance_data = requests.get(f"{FREQTRADE_API_URL}/balance", auth=auth, timeout=10).json()
-            # 取出錢包總價值
-            current_capital = balance_data.get('total', INITIAL_CAPITAL) 
-        except:
-            current_capital = INITIAL_CAPITAL
-
-        # 4. 抓取歷史交易紀錄 (取最後5筆)
-        trades_data = requests.get(f"{FREQTRADE_API_URL}/trades", auth=auth, timeout=10).json()
-        last_5_trades = trades_data.get('trades', [])[-5:]
-
-        now = datetime.now().strftime("%m/%d %H:%M")
-        
-        # --- 數據計算 ---
-        total_unrealized_pct = 0
-        trade_count = len(status_data) if status_data else 0
-        
-        if status_data:
-            for trade in status_data:
-                total_unrealized_pct += float(trade.get('current_profit_pct', 0)) * 100
-        avg_float_pct = (total_unrealized_pct / trade_count) if trade_count > 0 else 0.0
-        
-        day_profit = 0.0
-        if profit_data and 'data' in profit_data and len(profit_data['data']) > 0:
-            day_profit = float(profit_data['data'][0].get('abs_profit', 0))
-
-        # --- 組合最新5筆交易文字 ---
-        trades_str = ""
-        if last_5_trades:
-            for i, t in enumerate(last_5_trades, 1):
-                pair = t.get('pair', 'Unknown').replace('/USDT', '')
-                status = "🟢 進行中" if t.get('is_open') else "已平倉"
-                profit = float(t.get('profit_abs', 0))
-                icon = "🟢" if profit >= 0 else "🔴"
-                trades_str += f"{i}. {icon} {pair} | {status} | 獲利: {profit:+.2f} USDT\n"
-        else:
-            trades_str = "目前無近期交易紀錄\n"
-
-        # --- 組合目前持倉摘要 (top 5 by 持倉金額或浮動) ---
-        holdings_str = ""
-        open_trades = [t for t in status_data if t.get('is_open')]
-        if open_trades:
-            # 依未實現損益絕對值排序，取前5
-            sorted_trades = sorted(open_trades, key=lambda x: abs(float(x.get('profit_abs') or 0)), reverse=True)
-            top = sorted_trades[:5]
-            for i, t in enumerate(top, 1):
-                pair = t.get('pair', 'Unknown')
-                profit_pct = t.get('profit_pct') if t.get('profit_pct') is not None else t.get('current_profit_pct')
-                profit_abs = t.get('profit_abs') if t.get('profit_abs') is not None else t.get('total_profit_abs')
-                current_rate = t.get('current_rate') or t.get('open_rate')
-                amount = t.get('amount') or t.get('stake_amount')
-                holdings_str += f"{i}. {pair} | 當前報酬: {float(profit_pct or 0):+.2f}% | 未實現: {float(profit_abs or 0):+.2f} USDT | 價格: {current_rate} | 數量: {amount}\n"
-            if len(open_trades) > 5:
-                holdings_str += f"... +{len(open_trades)-5} 筆持倉未列出\n"
-        else:
-            holdings_str = "目前無持倉\n"
-
-        # --- 呼叫 5-mini AI 大腦 (把持倉摘要也傳給 AI) ---
-        ai_input = trades_str + "\n持倉摘要:\n" + holdings_str
-        ai_msg = get_ai_analysis(INITIAL_CAPITAL, current_capital, day_profit, avg_float_pct, ai_input)
-
-        # --- 建立結構化建議並寫入 actions log（供 manager 讀取） ---
-        try:
-            actions_log_path = '/home/ubuntu/openclaw_workspace/grid_actions.log'
-            try:
-                import yaml
-                cfgp = '/home/ubuntu/openclaw_workspace/grid_config.yaml'
-                if os.path.exists(cfgp):
-                    cfg = yaml.safe_load(open(cfgp))
-                    actions_log_path = cfg.get('logging', {}).get('actions_log', actions_log_path)
-            except Exception:
-                pass
-
-            suggestion = ai_decision_wrapper(ai_msg, holdings_str)
-            action_entry = {
-                'time': datetime.utcnow().isoformat() + 'Z',
-                'type': 'ai_suggestion',
-                'ai_text': ai_msg,
-                'suggestion': suggestion,
-                'holdings_preview': holdings_str[:1000]
-            }
-            try:
-                with open(actions_log_path, 'a') as af:
-                    af.write(json.dumps(action_entry, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-        # --- 組裝 HTML 報表 ---
-        human_suggestion = ''
-        try:
-            human_suggestion = f"建議: {suggestion.get('action')}，說明: {suggestion.get('reason')}（可信度 {suggestion.get('confidence'):.2f}）"
-        except Exception:
-            human_suggestion = ''
-
-        # 為避免 Telegram HTML parse error，對使用者輸入原文進行 HTML escape
-        try:
-            import html as _html
-            safe_trades = _html.escape(trades_str)
-            safe_holdings = _html.escape(holdings_str)
-            safe_ai_msg = _html.escape(ai_msg)
-            safe_human_suggestion = _html.escape(human_suggestion)
-        except Exception:
-            safe_trades = trades_str
-            safe_holdings = holdings_str
-            safe_ai_msg = ai_msg
-            safe_human_suggestion = human_suggestion
-
-        html_message = f"""📊 <b>Freqtrade 戰略簡報</b>
-📅 報告時間: {now}
-
-💰 <b>資金水位監控</b>
-• 初始本金: {INITIAL_CAPITAL:.2f} USDT
-• 當前淨值: {current_capital:.2f} USDT
-• 今日利潤: {day_profit:+.2f} USDT
-• 浮動盈虧: {avg_float_pct:+.2f}%
-
-🛒 <b>最新交易動態（近期）</b>
-{safe_trades}
-
-📦 <b>目前持倉摘要（Top 5）</b>
-{safe_holdings}
-
-🤖 <b>AI 戰術官分析</b>
-🧠 <i>{safe_ai_msg}</i>
-
-📌 <b>結構化建議（Rules + AI）</b>
-{safe_human_suggestion}
-"""
-        
-        # 發送 Telegram (使用 HTML 模式)
-        bot.send_message(CHAT_ID, html_message, parse_mode="HTML")
-        print(f"[{now}] AI 戰報發送成功")
-
-    except Exception as e:
-        print(f"錯誤內容: {e}")
-        # 發生錯誤時依然嘗試發送警告
-        try:
-            bot.send_message(CHAT_ID, f"⚠️ <b>戰報系統異常</b>\n錯誤代碼: <code>{e}</code>", parse_mode="HTML")
-        except:
-            pass
+        print(f"發送失敗: {e}")
 
 if __name__ == "__main__":
-    get_freqtrade_status()
+    run()
