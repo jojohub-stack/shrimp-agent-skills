@@ -1,0 +1,14 @@
+.env
+.hermes/
+.venv/
+venv/
+node_modules/
+*.log
+mlruns/
+mlflow.db
+outputs/
+*.pptx
+*.xlsx
+__pycache__/
+*.bak
+.DS_Store
